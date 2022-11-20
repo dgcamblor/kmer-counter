@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
 #------------------------------------------------------------------------------
-#                               kmer_counter
+# kmer_counter.py
 #------------------------------------------------------------------------------
 
-# Author: @dgcamblor
-# Version: 1.0
+__author__ = "@dgcamblor"
+__version__ = "1.1"
+__license__ = "MIT"
 
 import argparse
 import os
@@ -15,37 +16,45 @@ import threading
 import time
 import re 
 from collections import defaultdict  
-from multiprocessing import cpu_count, Pool 
-
+from multiprocessing import cpu_count, Process, Pipe
 
 parser = argparse.ArgumentParser(description="Counts k-mers (overlapping \
-nucleotide words of length k) in a FASTA/multi-FASTA file storing a DNA \
+    nucleotide words of length k) in a FASTA/multi-FASTA file storing a DNA \
     sequence")
 
 parser.add_argument("filename", help="Name or path (path/to/file.fa) to the \
     FASTA/multi-FASTA file")
 parser.add_argument("klength", help="Length of the k-mers (how much \
-nucleotides are the words comprised of) (e.g., KLENGTH = 3 means \
+    nucleotides are the words comprised of) (e.g., KLENGTH = 3 means \
     counting trinucleotides)", type=int)
+
+parser.add_argument("-v", "--version", action="version", version="%(prog)s " + 
+    __version__)
 parser.add_argument("-m", "--minimum", help="Filter output to only words \
     surpassing a minimum frequency", type=int)
 parser.add_argument("-i", "--include", help="Include non-nucleotide symbols \
     in the output (N, R/purine, Y/pyrimidine, etc.), and also soft masked \
-        nucleotides (acgt)", action="store_true")
+    nucleotides (acgt)", action="store_true")
 parser.add_argument("-o", "--output", help="Store the results in an output \
     file (OUTPUT = name of the file)", type=str)
+parser.add_argument("-x", "--processes", help="Number of processes to use \
+    (default: number of cores)", type=int)
+
 args = parser.parse_args()
 
+# Global variables
 FILENAME = args.filename
 KLENGTH = args.klength
 MINIMUM = args.minimum if args.minimum else 1
+NCPU = args.processes if args.processes else cpu_count()
 
 # Declare regexes
 HEADER = re.compile(">.*\n")
 NEWLINE = re.compile("\n")  
 NONNUCLEOTIDE = re.compile("[^ACGT]")
 
-ended = False  # Requirement for the loading bar
+# Requirement for the loading bar, tracks if the program has finished
+ended = False  
 
 
 def check_input():
@@ -64,18 +73,35 @@ def loading():
     for c in itertools.cycle(['.  ', '.. ', '...']):
         if ended == True:
             break
-        sys.stdout.write('\rProcessing ' + c)
+        sys.stdout.write('\rCounting k-mers' + c)
         sys.stdout.flush()
         time.sleep(0.5)
 
 
-def get_seq_frequencies(sequence, KLENGTH=KLENGTH):
+def loading_start():
+    """Starts the loading bar"""
+    t = threading.Thread(target=loading)
+    t.daemon = True
+    t.start()
+
+
+def loading_stop():
+    """Stops the loading bar to display the results"""
+    global ended
+    ended = True
+    sys.stdout.write('\r' + ' ' * 18 + '\n')  # Clear the loading bar
+    sys.stdout.flush()
+
+
+def get_seq_frequencies(sequences, conn, KLENGTH=KLENGTH):
     """Obtain a dictionary of kmer frequencies from a nucleotide sequence. Its
     main purpose is to be called for each fragment of the parallelization 
     process.
 
     Args:
-        sequence (str): nucleotide sequence
+        sequence s(str): nucleotide sequences assigned to the current process.
+        conn (multiprocessing.Pipe): pipe to send the results to the main
+            process.
         KLENGTH (int): length of kmers. Already specified so that the function
         is called seamlessly inside the parallelization process. 
             Defaults to KLENGTH (as introduced by the user).
@@ -85,13 +111,14 @@ def get_seq_frequencies(sequence, KLENGTH=KLENGTH):
         contain other symbols apart from nucleotides.
     """
     frequencies = defaultdict(int)  # Initialize dict with 0s
+
+    for sequence in sequences:
+        # (- KLENGTH + 1) avoids endings with length(kmer) < KLENGTH
+        for i in range(len(sequence) - KLENGTH + 1): 
+            kmer = sequence[i:i+KLENGTH]
+            frequencies[kmer] += 1
     
-    # (- KLENGTH + 1) avoids endings with length(kmer) < KLENGTH
-    for i in range(len(sequence) - KLENGTH + 1): 
-        kmer = sequence[i:i+KLENGTH]
-        frequencies[kmer] += 1
-    
-    return frequencies
+    conn.send(frequencies)
 
 
 def get_file_frequencies(filename, ncpu):
@@ -103,14 +130,12 @@ def get_file_frequencies(filename, ncpu):
     Args:
         filename (str): the file containing the sequences which frequencies
         will be computed.
-        ncpu (int): number of cpus used to perform parallelization
+        ncpu (int): number of cpus/processes used to perform parallelization
 
     Returns:
         dict: Dictionary of pairs kmer:frequency for the file. It may 
         contain other symbols apart from nucleotides.
     """
-    frequencies = defaultdict(int)  # Initialize dict with 0s
-
     with open(filename, "r") as F:
         # We aim to split a multiFASTA into its constitutive FASTAs
         fastas = re.split(HEADER, F.read()) 
@@ -123,22 +148,63 @@ def get_file_frequencies(filename, ncpu):
                 continue
 
             fasta = NEWLINE.sub("", fasta)
-            n = len(fasta)//ncpu
+            fasta_len = len(fasta)
 
-            chunks = [fasta[i:i+n+KLENGTH-1] for i in range(0, len(fasta), n)]
+            n_chunk = fasta_len//ncpu  # Number of nucleotides per chunk 
+            remainder = fasta_len % ncpu  # Remainder of nucleotides
+
+            if n_chunk == 0: 
+                loading_stop()
+                print("ERROR: sequence in FASTA file is too short to be "  \
+                      " processed with the current number of processes, " \
+                        "try lowering it with -x")
+                sys.exit()
+
+            # Split the FASTA into chunks of n_chunk nucleotides, taking 
+            # into account the remainder
+            chunks = []
+            start = 0
+            overlap = KLENGTH - 1  # Overlap between chunks
+
+            for _ in range(ncpu):
+                end = start + n_chunk + overlap
+                if remainder > 0:
+                    end += 1
+                    remainder -= 1
+                chunks.append(fasta[start:end])
+                start = end - overlap
 
             fasta_chunks.extend(chunks)
 
-        # Parallel kmer counting (number of threads = number of cores)
-        with Pool(ncpu) as pool:
-            counts = pool.map(get_seq_frequencies, fasta_chunks)
+    # Now we can parallelize the computation of frequencies in each chunk
+    conn_list = []
+    proc_list = []
 
-        # Unify the counts
-        for count in counts:
-            for kmer, frequency in count.items():
-                frequencies[kmer] += frequency
+    for i_proc in range(ncpu):
+        task = [fasta_chunks[i_chunk] for i_chunk in range(i_proc, len(fasta_chunks), ncpu)]
+        
+        parent_conn, child_conn = Pipe()  # Sending results to main process
+        conn_list.append(parent_conn)
 
-    return frequencies
+        p = Process(target=get_seq_frequencies, args=(task, child_conn))
+        proc_list.append(p)
+        
+        proc_list[i_proc].start()
+
+    # Wait for all processes to finish (when they send their results)
+    while True:
+        if all([conn.poll() for conn in conn_list]):
+            break
+
+    # Unify the counts
+    file_frequencies = defaultdict(int)  # Initialize dict with 0s
+
+    for conn in conn_list:
+        proc_frequncies = conn.recv()
+        for kmer, count in proc_frequncies.items():
+            file_frequencies[kmer] += count
+
+    return file_frequencies
 
 
 def show_results(frequencies):
@@ -159,7 +225,7 @@ def show_results(frequencies):
 
     print("---------------------------")
     print("       K-mer counter       ")
-    print("       By: @dgcamblor      ")
+    print(f"       By: {__author__}      ")
     print("---------------------------")
     print(f"File: {FILENAME}          ")
     print("---------------------------")
@@ -177,7 +243,7 @@ def show_results(frequencies):
             kmer = NONNUCLEOTIDE.sub("", kmer)  
         if len(kmer) == KLENGTH:
             if frequency >= MINIMUM:  # Filtering output by minimum
-                print(f"*  {kmer}  {frequency}")  # Provide * for grep
+                print(f"*\t{kmer}\t{frequency}")  # Provide * for grep
                 total += frequency
                 different += 1
 
@@ -193,22 +259,9 @@ def show_results(frequencies):
 def main():
     check_input()
 
-    #-------Loading bar requirements---------
-    global ended
-    t = threading.Thread(target=loading)
-    t.daemon = True
-    t.start()
-    #----------------------------------------
-
-    ncpu = cpu_count()
-
-    file_freqs = get_file_frequencies(FILENAME, ncpu)
-
-    #-------Stop loading bar-----------------      
-    ended = True
-    sys.stdout.write('\rDone!         \n\n')
-    sys.stdout.flush()
-    #----------------------------------------
+    loading_start()
+    file_freqs = get_file_frequencies(FILENAME, NCPU)
+    loading_stop()
 
     show_results(file_freqs)
 
